@@ -659,6 +659,32 @@ class AgentSystemTest(unittest.TestCase):
             worker._run()
         worker._stop_event.wait.assert_called_once_with(0.17)
 
+    def test_background_indexer_records_subprocess_signal_exit(self):
+        class ExitedProcess:
+            exitcode = -11
+
+            def is_alive(self):
+                return False
+
+            def join(self, timeout=None):
+                return None
+
+        worker = AgentIndexWorker(self.db_file, idle_seconds=0.1)
+        worker._start_process = MagicMock(return_value=ExitedProcess())
+        worker._stop_event = MagicMock()
+        worker._stop_event.is_set.side_effect = [False, False, True]
+
+        with patch("gongkao.agent_indexer.logging.error"):
+            worker._supervise()
+
+        with connect(self.db_file) as conn:
+            state = conn.execute(
+                "SELECT status, last_error FROM agent_context_worker_state WHERE id = 1"
+            ).fetchone()
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("signal 11", state["last_error"])
+        worker._stop_event.wait.assert_called_once_with(0.1)
+
     def test_attempt_update_refreshes_only_pending_chunks(self):
         with connect(self.db_file) as conn:
             rebuild_agent_context_index(conn)
