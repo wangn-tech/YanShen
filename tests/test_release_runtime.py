@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 
 import launcher as desktop_launcher
 from gongkao.ai_config import load_effective_agent_settings
-from gongkao.db import CURRENT_SCHEMA_VERSION, connect, prepare_user_database
+from gongkao.db import CURRENT_SCHEMA_VERSION, connect, init_db, prepare_user_database
 from gongkao.grading import build_grading_package
 from gongkao.organizations import canonicalize_organization
 from gongkao.services.personal_records import (
@@ -231,6 +231,53 @@ class ReleaseRuntimeTest(unittest.TestCase):
         audit_database(SEED)
         with connect(SEED) as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], CURRENT_SCHEMA_VERSION)
+
+    def test_agent_context_content_hash_columns_are_added_to_old_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user_db = Path(directory) / "gongkao.sqlite3"
+            init_db(user_db)
+            with connect(user_db) as conn:
+                conn.execute(
+                    "UPDATE agent_context_index_state SET dirty = 0, full_rebuild = 0 WHERE id = 1"
+                )
+                conn.execute("ALTER TABLE agent_context_chunks DROP COLUMN content_hash")
+                conn.execute("ALTER TABLE agent_context_vectors DROP COLUMN content_hash")
+                conn.execute("DROP TABLE agent_context_dense_vectors")
+                conn.execute("PRAGMA user_version = 5")
+
+            init_db(user_db)
+
+            with connect(user_db) as conn:
+                chunk_columns = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(agent_context_chunks)")
+                }
+                vector_columns = {
+                    row["name"]
+                    for row in conn.execute("PRAGMA table_info(agent_context_vectors)")
+                }
+                self.assertIn("content_hash", chunk_columns)
+                self.assertIn("content_hash", vector_columns)
+                self.assertTrue(
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'agent_context_dense_vectors'"
+                    ).fetchone()
+                )
+                self.assertTrue(
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'index' AND name = 'idx_agent_context_dense_model'"
+                    ).fetchone()
+                )
+                state = conn.execute(
+                    "SELECT dirty, full_rebuild FROM agent_context_index_state WHERE id = 1"
+                ).fetchone()
+                self.assertEqual((state["dirty"], state["full_rebuild"]), (1, 1))
+                self.assertEqual(
+                    conn.execute("PRAGMA user_version").fetchone()[0],
+                    CURRENT_SCHEMA_VERSION,
+                )
 
     def test_release_audit_rejects_private_agent_data(self):
         with tempfile.TemporaryDirectory() as directory:

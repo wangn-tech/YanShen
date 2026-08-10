@@ -639,6 +639,7 @@ SCHEMA_V4_ADDITIVE_TABLES = frozenset(
     {
         "agent_ai_settings",
         "agent_context_vectors",
+        "agent_context_dense_vectors",
         "agent_context_fts",
         "agent_context_worker_state",
     }
@@ -692,6 +693,60 @@ def _table_names(conn):
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         )
     }
+
+
+def _column_names(conn, table):
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _ensure_agent_context_schema(conn):
+    changed = False
+    tables = _table_names(conn)
+    if "agent_context_chunks" in tables:
+        chunk_columns = _column_names(conn, "agent_context_chunks")
+        if "content_hash" not in chunk_columns:
+            conn.execute(
+                "ALTER TABLE agent_context_chunks "
+                "ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+            )
+            changed = True
+    if "agent_context_vectors" in tables:
+        vector_columns = _column_names(conn, "agent_context_vectors")
+        if "content_hash" not in vector_columns:
+            conn.execute(
+                "ALTER TABLE agent_context_vectors "
+                "ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+            )
+            changed = True
+    if "agent_context_dense_vectors" not in tables:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_context_dense_vectors (
+                chunk_id INTEGER NOT NULL REFERENCES agent_context_chunks(id) ON DELETE CASCADE,
+                embedding_model TEXT NOT NULL,
+                dimensions INTEGER NOT NULL,
+                vector_json TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chunk_id, embedding_model)
+            )
+            """
+        )
+        changed = True
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_agent_context_dense_model
+        ON agent_context_dense_vectors(embedding_model, dimensions, chunk_id)
+        """
+    )
+    if changed and "agent_context_index_state" in _table_names(conn):
+        conn.execute(
+            "INSERT OR IGNORE INTO agent_context_index_state (id, dirty, full_rebuild) "
+            "VALUES (1, 1, 1)"
+        )
+        conn.execute(
+            "UPDATE agent_context_index_state SET dirty = 1, full_rebuild = 1 WHERE id = 1"
+        )
 
 
 def _ensure_index_queue_triggers(conn):
@@ -805,6 +860,7 @@ def init_db(db_path):
                 }
                 if "answer_format_json" not in attempt_columns:
                     raise RuntimeError("current database schema is incomplete; missing attempts.answer_format_json")
+                _ensure_agent_context_schema(conn)
                 _ensure_index_worker_schema(conn)
                 try:
                     conn.execute("PRAGMA journal_mode = WAL")
